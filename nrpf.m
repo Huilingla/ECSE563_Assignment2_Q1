@@ -1,11 +1,30 @@
-function [V, delta, Psl, Qgv, N, time] = nrpf(Y, is, ipq, ipv, Pg, Qg, Pd, Qd, V0, Sbase, toler, maxiter)
-%NRPF Newton-Raphson Power Flow Solution
-%   [V, delta, Psl, Qgv, N, time] = nrpf(Y, is, ipq, ipv, Pg, Qg, Pd, Qd, V0, Sbase, toler, maxiter)
-%   solves the power flow problem using the Newton-Raphson method.
+function [V, delta, Ps1, Qgv, N, time] = nrpf(Y, is, ipq, ipv, Pg, Qg, Pd, Qd, V0, Sbase, toler, maxiter)
+%NRPF Newton-Raphson Power Flow Solver
+%   [V, delta, Ps1, Qgv, N, time] = nrpf(Y, is, ipq, ipv, Pg, Qg, Pd, Qd, V0, Sbase, toler, maxiter)
+%
+%   Inputs:
+%   Y - Network admittance matrix
+%   is - Index of slack node
+%   ipq - Vector of PQ node indices
+%   ipv - Vector of PV node indices  
+%   Pg, Qg - Generation active/reactive power vectors (MW/Mvar)
+%   Pd, Qd - Demand active/reactive power vectors (MW/Mvar)
+%   V0 - Initial voltage magnitude vector (p.u.)
+%   Sbase - Network power base (MVA)
+%   toler - Convergence tolerance (p.u.)
+%   maxiter - Maximum iterations
+%
+%   Outputs:
+%   V - Voltage magnitudes (p.u.)
+%   delta - Voltage angles (radians)
+%   Ps1 - Slack bus active generation (MW)
+%   Qgv - PV bus reactive generation (Mvar)
+%   N - Number of iterations to convergence
+%   time - CPU time (seconds)
 
-    tstart = tic; % Start timer
+    tstart = tic; % Start timing
     
-    % Convert inputs to per unit
+    % Convert power inputs to per unit
     Pg_pu = Pg / Sbase;
     Qg_pu = Qg / Sbase;
     Pd_pu = Pd / Sbase;
@@ -13,255 +32,237 @@ function [V, delta, Psl, Qgv, N, time] = nrpf(Y, is, ipq, ipv, Pg, Qg, Pd, Qd, V
     
     nbus = size(Y, 1); % Total number of buses
     
-    % Initialize variables
+    % Initialize voltage vectors
     V = V0; % Voltage magnitudes
-    delta = zeros(nbus, 1); % Voltage angles
-    P_spec = Pg_pu - Pd_pu; % Net specified active power
-    Q_spec = Qg_pu - Qd_pu; % Net specified reactive power
+    delta = zeros(nbus, 1); % Voltage angles (start flat)
     
-    % Identify all buses and create index mapping
-    all_buses = 1:nbus;
-    pq_buses = ipq;
-    pv_buses = ipv;
+    % Combine all non-slack buses
+    non_slack = sort([ipq; ipv]);
     
-    % Create mismatch vectors indices
-    npq = length(pq_buses);
-    npv = length(pv_buses);
+    % Separate PQ and PV buses for mismatch calculations
+    npq = length(ipq);
+    npv = length(ipv);
     
-    % Total number of unknowns
-    nunknowns = 2*npq + npv;
+    fprintf('Starting Newton-Raphson Power Flow...\n');
+    fprintf('System: %d buses (%d PQ, %d PV, 1 Slack)\n', nbus, npq, npv);
+    fprintf('Tolerance: %.2e, Max iterations: %d\n', toler, maxiter);
     
-    % Build index mapping for state variables
-    delta_idx = zeros(nbus, 1);
-    V_idx = zeros(nbus, 1);
-    
-    idx = 1;
-    % PV buses first (only delta unknown)
-    for i = 1:npv
-        bus = pv_buses(i);
-        delta_idx(bus) = idx;
-        idx = idx + 1;
-    end
-    
-    % PQ buses (both delta and V unknown)
-    for i = 1:npq
-        bus = pq_buses(i);
-        delta_idx(bus) = idx;
-        idx = idx + 1;
-        V_idx(bus) = idx;
-        idx = idx + 1;
-    end
-    
-    % Newton-Raphson iteration
-    converged = false;
-    N = 0;
-    
-    while ~converged && N < maxiter
-        N = N + 1;
-        
-        % Calculate power injections
-        P_calc = zeros(nbus, 1);
-        Q_calc = zeros(nbus, 1);
-        
-        for i = 1:nbus
-            theta_i = delta(i);
-            V_i = V(i);
-            
-            for j = 1:nbus
-                theta_ij = theta_i - delta(j);
-                Y_mag = abs(Y(i,j));
-                Y_angle = angle(Y(i,j));
-                
-                P_calc(i) = P_calc(i) + V_i * V(j) * Y_mag * cos(theta_ij + Y_angle);
-                Q_calc(i) = Q_calc(i) + V_i * V(j) * Y_mag * sin(theta_ij + Y_angle);
-            end
-        end
-        
-        % Calculate mismatches
-        deltaP = P_spec - P_calc;
-        deltaQ = Q_spec - Q_calc;
-        
-        % Remove slack bus from mismatch
-        deltaP(is) = [];
-        
-        % Create Q mismatch only for PQ buses
-        deltaQ_pq = [];
-        for i = 1:nbus
-            if i ~= is && ismember(i, pq_buses)
-                deltaQ_pq = [deltaQ_pq; deltaQ(i)];
-            end
-        end
-        
-        % Create complete mismatch vector
-        mismatch = [deltaP; deltaQ_pq];
+    for N = 1:maxiter
+        % Calculate power mismatches
+        [dP, dQ, Pcalc, Qcalc] = calculate_mismatches(Y, V, delta, Pg_pu, Qg_pu, Pd_pu, Qd_pu, ipq, ipv, is);
         
         % Check convergence
-        max_mismatch = max(abs(mismatch));
+        max_mismatch = max([abs(dP); abs(dQ)]);
+        fprintf('Iteration %d: Max mismatch = %.6f p.u.\n', N, max_mismatch);
+        
         if max_mismatch < toler
-            converged = true;
+            fprintf('Converged in %d iterations!\n', N);
             break;
         end
         
         % Build Jacobian matrix
-        J = zeros(nunknowns, nunknowns);
+        J = build_jacobian(Y, V, delta, ipq, ipv, non_slack);
         
-        % 1. dP/ddelta terms
-        for i = 1:nbus
-            if i == is, continue; end
-            
-            row_idx = delta_idx(i);
-            if row_idx == 0, continue; end
-            
-            for j = 1:nbus
-                if j == is, continue; end
-                
-                theta_ij = delta(i) - delta(j);
-                Y_mag = abs(Y(i,j));
-                Y_angle = angle(Y(i,j));
-                
-                if i == j
-                    % Diagonal elements
-                    J(row_idx, row_idx) = -Q_calc(i) - (V(i)^2) * imag(Y(i,i));
-                else
-                    % Off-diagonal elements
-                    col_idx = delta_idx(j);
-                    if col_idx > 0
-                        J(row_idx, col_idx) = V(i) * V(j) * Y_mag * sin(theta_ij + Y_angle);
-                    end
-                end
-            end
-        end
+        % Build mismatch vector for non-slack buses
+        mismatch = [dP(non_slack); dQ(ipq)];
         
-        % 2. dP/dV terms
-        for i = 1:nbus
-            if i == is, continue; end
-            
-            row_idx = delta_idx(i);
-            if row_idx == 0, continue; end
-            
-            for j = 1:nbus
-                if ~ismember(j, pq_buses), continue; end
-                
-                theta_ij = delta(i) - delta(j);
-                Y_mag = abs(Y(i,j));
-                Y_angle = angle(Y(i,j));
-                
-                col_idx = V_idx(j);
-                if col_idx == 0, continue; end
-                
-                if i == j
-                    J(row_idx, col_idx) = P_calc(i)/V(i) + V(i) * real(Y(i,i));
-                else
-                    J(row_idx, col_idx) = V(i) * Y_mag * cos(theta_ij + Y_angle);
-                end
-            end
-        end
+        % Solve for corrections using linsolve
+        corrections = linsolve(J, -mismatch);
         
-        % 3. dQ/ddelta terms
-        for i = 1:nbus
-            if i == is || ~ismember(i, pq_buses), continue; end
-            
-            row_idx = V_idx(i);
-            if row_idx == 0, continue; end
-            
-            for j = 1:nbus
-                if j == is, continue; end
-                
-                theta_ij = delta(i) - delta(j);
-                Y_mag = abs(Y(i,j));
-                Y_angle = angle(Y(i,j));
-                
-                if i == j
-                    col_idx = delta_idx(i);
-                    if col_idx > 0
-                        J(row_idx, col_idx) = P_calc(i) - (V(i)^2) * real(Y(i,i));
-                    end
-                else
-                    col_idx = delta_idx(j);
-                    if col_idx > 0
-                        J(row_idx, col_idx) = -V(i) * V(j) * Y_mag * cos(theta_ij + Y_angle);
-                    end
-                end
-            end
-        end
+        % Extract angle and voltage corrections
+        n_non_slack = length(non_slack);
+        ddelta_non_slack = corrections(1:n_non_slack);
+        dV_pq = corrections(n_non_slack+1:end);
         
-        % 4. dQ/dV terms
-        for i = 1:nbus
-            if i == is || ~ismember(i, pq_buses), continue; end
-            
-            row_idx = V_idx(i);
-            if row_idx == 0, continue; end
-            
-            for j = 1:nbus
-                if ~ismember(j, pq_buses), continue; end
-                
-                theta_ij = delta(i) - delta(j);
-                Y_mag = abs(Y(i,j));
-                Y_angle = angle(Y(i,j));
-                
-                col_idx = V_idx(j);
-                if col_idx == 0, continue; end
-                
-                if i == j
-                    J(row_idx, col_idx) = Q_calc(i)/V(i) - V(i) * imag(Y(i,i));
-                else
-                    J(row_idx, col_idx) = V(i) * Y_mag * sin(theta_ij + Y_angle);
-                end
-            end
-        end
+        % Update voltage angles for non-slack buses
+        delta(non_slack) = delta(non_slack) + ddelta_non_slack;
         
-        % Solve using linsolve()
-        opts.SYM = false;
-        opts.POSDEF = false;
-        correction = linsolve(J, mismatch, opts);
+        % Update voltage magnitudes for PQ buses only
+        V(ipq) = V(ipq) + dV_pq;
         
-        % Update state variables
-        for i = 1:nbus
-            if i == is, continue; end
-            idx_delta = delta_idx(i);
-            if idx_delta > 0
-                delta(i) = delta(i) + correction(idx_delta);
-            end
-        end
-        
-        for i = 1:npq
-            bus = pq_buses(i);
-            idx_V = V_idx(bus);
-            if idx_V > 0
-                V(bus) = V(bus) + correction(idx_V);
-            end
-        end
+        % Ensure PV bus voltages remain at specified values
+        V(ipv) = V0(ipv);
+    end
+    
+    if N == maxiter && max_mismatch >= toler
+        warning('Power flow did not converge within maximum iterations!');
     end
     
     % Calculate final power injections
-    P_calc_final = zeros(nbus, 1);
-    Q_calc_final = zeros(nbus, 1);
+    [~, ~, Pcalc, Qcalc] = calculate_mismatches(Y, V, delta, Pg_pu, Qg_pu, Pd_pu, Qd_pu, ipq, ipv, is);
     
-    for i = 1:nbus
-        for j = 1:nbus
-            theta_ij = delta(i) - delta(j);
-            Y_mag = abs(Y(i,j));
-            Y_angle = angle(Y(i,j));
-            
-            P_calc_final(i) = P_calc_final(i) + V(i) * V(j) * Y_mag * cos(theta_ij + Y_angle);
-            Q_calc_final(i) = Q_calc_final(i) + V(i) * V(j) * Y_mag * sin(theta_ij + Y_angle);
-        end
-    end
-    
-    % Output results
-    Psl = P_calc_final(is) * Sbase;
-    
-    Qgv = zeros(length(ipv), 1);
-    for i = 1:length(ipv)
-        bus = ipv(i);
-        Qgv(i) = Q_calc_final(bus) * Sbase;
-    end
+    % Calculate output quantities
+    Ps1 = Pcalc(is) * Sbase; % Slack bus active power in MW
+    Qgv = Qcalc(ipv) * Sbase; % PV bus reactive power in Mvar
     
     time = toc(tstart);
     
-    if ~converged
-        warning('Newton-Raphson failed to converge in %d iterations. Max mismatch: %e', maxiter, max_mismatch);
-    else
-        fprintf('Newton-Raphson converged in %d iterations\n', N);
+    fprintf('\n=== Power Flow Results ===\n');
+    fprintf('Solution time: %.4f seconds\n', time);
+    fprintf('Iterations: %d\n', N);
+    fprintf('Slack bus power: %.3f MW\n', Ps1);
+    
+    % Display bus results
+    fprintf('\nBus Results:\n');
+    fprintf('Bus  Type  |V|(p.u.)  Angle(deg)   Pg(MW)   Qg(Mvar)   Pd(MW)   Qd(Mvar)\n');
+    fprintf('------------------------------------------------------------------------\n');
+    
+    for i = 1:nbus
+        angle_deg = rad2deg(delta(i));
+        if i == is
+            bus_type = 'Slack';
+            Pg_disp = Ps1;
+            Qg_disp = Qcalc(i) * Sbase;
+        elseif ismember(i, ipv)
+            bus_type = 'PV';
+            Pg_disp = Pg(i);
+            Qg_disp = Qgv(ipv == i);
+        else
+            bus_type = 'PQ';
+            Pg_disp = Pg(i);
+            Qg_disp = Qg(i);
+        end
+        fprintf('%2d   %-5s  %8.4f   %8.2f   %8.1f   %8.1f   %8.1f   %8.1f\n', ...
+            i, bus_type, V(i), angle_deg, Pg_disp, Qg_disp, Pd(i), Qd(i));
+    end
+end
+
+function [dP, dQ, Pcalc, Qcalc] = calculate_mismatches(Y, V, delta, Pg_pu, Qg_pu, Pd_pu, Qd_pu, ipq, ipv, is)
+% Calculate power mismatches and computed power injections
+    nbus = length(V);
+    Pcalc = zeros(nbus, 1);
+    Qcalc = zeros(nbus, 1);
+    
+    % Calculate computed power injections
+    for i = 1:nbus
+        for k = 1:nbus
+            theta_ik = delta(i) - delta(k);
+            Pcalc(i) = Pcalc(i) + V(i) * V(k) * (real(Y(i,k)) * cos(theta_ik) + imag(Y(i,k)) * sin(theta_ik));
+            Qcalc(i) = Qcalc(i) + V(i) * V(k) * (real(Y(i,k)) * sin(theta_ik) - imag(Y(i,k)) * cos(theta_ik));
+        end
+    end
+    
+    % Calculate mismatches
+    dP = Pg_pu - Pd_pu - Pcalc;
+    dQ = Qg_pu - Qd_pu - Qcalc;
+    
+    % Zero out slack bus mismatches (they're not in the Jacobian)
+    dP(is) = 0;
+    
+    % Zero out PV bus reactive power mismatches
+    dQ(ipv) = 0;
+end
+
+function J = build_jacobian(Y, V, delta, ipq, ipv, non_slack)
+% Build the Jacobian matrix
+    nbus = length(V);
+    npq = length(ipq);
+    n_non_slack = length(non_slack);
+    
+    % Initialize Jacobian
+    J = zeros(n_non_slack + npq, n_non_slack + npq);
+    
+    % Fill J11 (dP/ddelta)
+    for i = 1:n_non_slack
+        row_idx = i;
+        bus_i = non_slack(i);
+        for j = 1:n_non_slack
+            col_idx = j;
+            bus_j = non_slack(j);
+            
+            if bus_i == bus_j
+                % Diagonal element
+                sum_term = 0;
+                for k = 1:nbus
+                    if k ~= bus_i
+                        theta_ik = delta(bus_i) - delta(k);
+                        sum_term = sum_term + V(bus_i) * V(k) * ...
+                            (-real(Y(bus_i,k)) * sin(theta_ik) + imag(Y(bus_i,k)) * cos(theta_ik));
+                    end
+                end
+                J(row_idx, col_idx) = sum_term;
+            else
+                % Off-diagonal element
+                theta_ij = delta(bus_i) - delta(bus_j);
+                J(row_idx, col_idx) = V(bus_i) * V(bus_j) * ...
+                    (real(Y(bus_i,bus_j)) * sin(theta_ij) - imag(Y(bus_i,bus_j)) * cos(theta_ij));
+            end
+        end
+    end
+    
+    % Fill J12 (dP/dV)
+    for i = 1:n_non_slack
+        row_idx = i;
+        bus_i = non_slack(i);
+        for j = 1:npq
+            col_idx = n_non_slack + j;
+            bus_j = ipq(j);
+            
+            if bus_i == bus_j
+                % Diagonal element
+                sum_term = 0;
+                for k = 1:nbus
+                    theta_ik = delta(bus_i) - delta(k);
+                    sum_term = sum_term + V(k) * (real(Y(bus_i,k)) * cos(theta_ik) + imag(Y(bus_i,k)) * sin(theta_ik));
+                end
+                J(row_idx, col_idx) = V(bus_i) * sum_term + V(bus_i) * real(Y(bus_i,bus_i)) * cos(0);
+            else
+                % Off-diagonal element
+                theta_ij = delta(bus_i) - delta(bus_j);
+                J(row_idx, col_idx) = V(bus_i) * (real(Y(bus_i,bus_j)) * cos(theta_ij) + imag(Y(bus_i,bus_j)) * sin(theta_ij));
+            end
+        end
+    end
+    
+    % Fill J21 (dQ/ddelta)
+    for i = 1:npq
+        row_idx = n_non_slack + i;
+        bus_i = ipq(i);
+        for j = 1:n_non_slack
+            col_idx = j;
+            bus_j = non_slack(j);
+            
+            if bus_i == bus_j
+                % Diagonal element
+                sum_term = 0;
+                for k = 1:nbus
+                    if k ~= bus_i
+                        theta_ik = delta(bus_i) - delta(k);
+                        sum_term = sum_term + V(bus_i) * V(k) * ...
+                            (real(Y(bus_i,k)) * cos(theta_ik) + imag(Y(bus_i,k)) * sin(theta_ik));
+                    end
+                end
+                J(row_idx, col_idx) = sum_term;
+            else
+                % Off-diagonal element
+                theta_ij = delta(bus_i) - delta(bus_j);
+                J(row_idx, col_idx) = -V(bus_i) * V(bus_j) * ...
+                    (real(Y(bus_i,bus_j)) * cos(theta_ij) + imag(Y(bus_i,bus_j)) * sin(theta_ij));
+            end
+        end
+    end
+    
+    % Fill J22 (dQ/dV)
+    for i = 1:npq
+        row_idx = n_non_slack + i;
+        bus_i = ipq(i);
+        for j = 1:npq
+            col_idx = n_non_slack + j;
+            bus_j = ipq(j);
+            
+            if bus_i == bus_j
+                % Diagonal element
+                sum_term = 0;
+                for k = 1:nbus
+                    theta_ik = delta(bus_i) - delta(k);
+                    sum_term = sum_term + V(k) * (real(Y(bus_i,k)) * sin(theta_ik) - imag(Y(bus_i,k)) * cos(theta_ik));
+                end
+                J(row_idx, col_idx) = V(bus_i) * sum_term - V(bus_i) * imag(Y(bus_i,bus_i)) * cos(0);
+            else
+                % Off-diagonal element
+                theta_ij = delta(bus_i) - delta(bus_j);
+                J(row_idx, col_idx) = V(bus_i) * (real(Y(bus_i,bus_j)) * sin(theta_ij) - imag(Y(bus_i,bus_j)) * cos(theta_ij));
+            end
+        end
     end
 end
